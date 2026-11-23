@@ -94,4 +94,24 @@ check('punctuation off', one('hello there', 'en', { punctuation: false }), 'hell
   passed++;
 }
 
+// ---- each change says which input segment it came from
+{
+  const r = correct([
+    { text: 'hello there', lang: 'en' },
+    { text: 'i should of gone', lang: 'en' },
+    { text: 'עם אתה רוצה', lang: 'he' },
+  ]);
+  assert.ok(r.changes.length > 0);
+  assert.ok(r.changes.every((c) => Number.isInteger(c.index)));
+  assert.ok(r.changes.some((c) => c.rule === 'sound-alike' && c.index === 1));
+  assert.ok(r.changes.some((c) => c.rule === 'עם/אם' && c.index === 2));
+  assert.ok(r.segments.every((s) => !('_i' in s)));
+  passed++;
+}
+{
+  // extra fields on segments (like a recording id) are kept
+  const r = correct([{ text: 'hi', lang: 'en', recId: 'abc' }]);
+  check('keeps extra fields', r.segments[0].recId, 'abc');
+}
+
 console.log(`All ${passed} checks passed.`);

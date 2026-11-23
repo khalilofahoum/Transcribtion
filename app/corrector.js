@@ -255,7 +255,7 @@
         if (sc >= bestScore) { best = a; bestScore = sc; }
       }
       if (!best) return s;
-      changes.push({ rule: 'better alternative', before: s.text, after: best.text });
+      changes.push({ rule: 'better alternative', before: s.text, after: best.text, index: s._i });
       return Object.assign({}, s, { text: best.text });
     });
   }
@@ -319,7 +319,7 @@
         const re = new RegExp(B0 + w + B1, 'gu');
         if (re.test(text)) {
           text = text.replace(re, target);
-          changes.push({ rule: 'consistency', before: w, after: target });
+          changes.push({ rule: 'consistency', before: w, after: target, index: s._i });
         }
       }
       return text === s.text ? s : Object.assign({}, s, { text });
@@ -339,15 +339,23 @@
 
   /**
    * segments: [{ text, lang: 'en'|'he'|'ar', confidence?, alternatives?: [{text, confidence}] }]
-   * returns { segments (same shape, corrected text), changes: [{rule, before, after}] }
+   * returns { segments (same shape, corrected text), changes: [{rule, before, after, index}] }
+   * where index is the position in the input array of the segment the change was made in.
    */
   function correct(segments, opts) {
     opts = opts || {};
     const changes = [];
-    let out = rerank(segments, changes);
-    out = out.map((s) => Object.assign({}, s, { text: correctText(s.text, s.lang, opts, changes) })).filter((s) => s.text);
+    let out = segments.map((s, i) => Object.assign({}, s, { _i: i }));
+    out = rerank(out, changes);
+    out = out.map((s) => {
+      const local = [];
+      const text = correctText(s.text, s.lang, opts, local);
+      for (const c of local) { c.index = s._i; changes.push(c); }
+      return Object.assign({}, s, { text });
+    }).filter((s) => s.text);
     out = unify(out, changes);
     if (opts.punctuation !== false) out = out.map((s) => Object.assign({}, s, { text: punctuate(s.text, s.lang) }));
+    out = out.map(({ _i, ...rest }) => rest);
     return { segments: out, changes };
   }
 

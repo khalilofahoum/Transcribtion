@@ -12,71 +12,120 @@
 </head>
 <body>
   <main>
-    <header>
-      <h1>Transcriber</h1>
-      <div class="langs" role="group" aria-label="Spoken language">
-        <button type="button" data-lang="en">English</button>
-        <button type="button" data-lang="he" lang="he">עברית</button>
-        <button type="button" data-lang="ar" lang="ar">العربية</button>
+    <!-- Start screen -->
+    <section id="home" class="screen">
+      <h1 class="appName">Transcriber</h1>
+
+      <div class="choices">
+        <button type="button" id="newBtn" class="choice primary">
+          <span class="choiceTitle">New recording</span>
+          <span class="choiceSub">Start a new recording with its own title</span>
+        </button>
+        <button type="button" id="loadBtn" class="choice">
+          <span class="choiceTitle">Load recording</span>
+          <span class="choiceSub">Open an earlier recording and add to it</span>
+        </button>
       </div>
-    </header>
 
-    <section class="recorder">
-      <button type="button" id="record" aria-pressed="false">
-        <span class="dot" aria-hidden="true"></span>
-        <span id="recordLabel">Start recording</span>
-      </button>
-      <button type="button" id="pause" hidden>Pause</button>
-      <span id="timer" aria-live="off">00:00</span>
-    </section>
-    <p id="status" role="status"></p>
-
-    <section class="output">
-      <div class="outputBar">
-        <div class="views" id="views" hidden role="group" aria-label="Version">
-          <button type="button" data-view="corrected">Corrected</button>
-          <button type="button" data-view="original">Original</button>
+      <form id="newForm" class="panel" hidden novalidate>
+        <label for="newTitle">Title</label>
+        <input id="newTitle" type="text" maxlength="120" autocomplete="off" dir="auto" placeholder="For example: Meeting with Dani">
+        <p id="newError" class="error" hidden>Give the recording a title.</p>
+        <div class="row">
+          <button type="button" id="newCancel">Cancel</button>
+          <button type="submit" class="primary">Create</button>
         </div>
-        <span id="count"></span>
+      </form>
+
+      <div id="loadPanel" class="panel" hidden>
+        <h2>Saved recordings</h2>
+        <ul id="memoryList"></ul>
+        <p id="memoryEmpty" class="muted" hidden>Nothing saved yet. Start with New recording.</p>
       </div>
-      <div id="transcript" spellcheck="true" aria-label="Transcript"></div>
-      <details id="fixes" hidden>
-        <summary id="fixesSummary"></summary>
-        <ul id="fixesList"></ul>
-      </details>
-      <div class="actions">
-        <button type="button" id="copy">Copy text</button>
-        <button type="button" id="export">Export…</button>
-        <button type="button" id="clear" class="quiet">Clear</button>
-      </div>
+
+      <p id="homeStatus" role="status"></p>
     </section>
 
-    <details class="settings">
-      <summary>Settings</summary>
-      <label><input type="checkbox" id="optFillers"> Remove filler sounds (um, uh, אה, امم)</label>
-      <label><input type="checkbox" id="optPunct"> Add capital letters and end-of-sentence punctuation</label>
-      <label><input type="checkbox" id="optAudio"> Also record the audio (kept until you close the app)</label>
-      <label>Arabic dialect
-        <select id="optDialect">
-          <option value="ar-IL">Israel</option>
-          <option value="ar-PS">Palestine</option>
-          <option value="ar-JO">Jordan</option>
-          <option value="ar-LB">Lebanon</option>
-          <option value="ar-EG">Egypt</option>
-          <option value="ar-SA">Saudi Arabia / Standard</option>
-        </select>
-      </label>
-      <p class="hint">Speech is recognized by your browser's online speech service, so an internet connection is needed while recording. The transcript itself stays on this device.</p>
-    </details>
+    <!-- One recording (title) with all its sessions -->
+    <section id="memoryView" class="screen" hidden>
+      <div class="topBar">
+        <button type="button" id="back" class="quiet">← All recordings</button>
+        <div class="langs" role="group" aria-label="Spoken language">
+          <button type="button" data-lang="en">English</button>
+          <button type="button" data-lang="he" lang="he">עברית</button>
+          <button type="button" data-lang="ar" lang="ar">العربية</button>
+        </div>
+      </div>
+
+      <div class="titleRow">
+        <h1 id="memTitle" dir="auto"></h1>
+        <button type="button" id="rename" class="link">Rename</button>
+      </div>
+      <p id="memMeta"></p>
+
+      <section class="recorder">
+        <button type="button" id="record" aria-pressed="false">
+          <span class="dot" aria-hidden="true"></span>
+          <span id="recordLabel">Start recording</span>
+        </button>
+        <button type="button" id="pause" hidden>Pause</button>
+        <span id="timer" aria-live="off">00:00</span>
+      </section>
+      <p id="status" role="status"></p>
+
+      <section class="output">
+        <div class="outputBar">
+          <div class="views" id="views" hidden role="group" aria-label="Version">
+            <button type="button" data-view="corrected">Corrected</button>
+            <button type="button" data-view="original">Original</button>
+          </div>
+          <span id="count"></span>
+        </div>
+        <div id="transcript" spellcheck="true" aria-label="Transcript"></div>
+        <details id="fixes" hidden>
+          <summary id="fixesSummary"></summary>
+          <ul id="fixesList"></ul>
+        </details>
+        <div class="actions">
+          <button type="button" id="copy">Copy text</button>
+          <button type="button" id="export">Export…</button>
+        </div>
+      </section>
+
+      <details class="settings">
+        <summary>Settings</summary>
+        <label><input type="checkbox" id="optFillers"> Remove filler sounds (um, uh, אה, امم)</label>
+        <label><input type="checkbox" id="optPunct"> Add capital letters and end-of-sentence punctuation</label>
+        <label><input type="checkbox" id="optAudio"> Also record the audio</label>
+        <label>Arabic dialect
+          <select id="optDialect">
+            <option value="ar-IL">Israel</option>
+            <option value="ar-PS">Palestine</option>
+            <option value="ar-JO">Jordan</option>
+            <option value="ar-LB">Lebanon</option>
+            <option value="ar-EG">Egypt</option>
+            <option value="ar-SA">Saudi Arabia / Standard</option>
+          </select>
+        </label>
+        <p class="hint">Speech is recognized by your browser's online speech service, so an internet connection is needed while recording. Transcripts and audio are saved only on this device.</p>
+      </details>
+    </section>
   </main>
 
   <dialog id="exportDialog" aria-labelledby="exportTitle">
     <h2 id="exportTitle">Export</h2>
     <p id="exportNote"></p>
-    <label><input type="checkbox" id="outCorrected"> <span>Corrected transcript <small>.txt</small></span></label>
-    <label><input type="checkbox" id="outOriginal"> <span>Raw transcript, exactly as heard <small>.txt</small></span></label>
-    <label><input type="checkbox" id="outFixes"> <span>List of automatic fixes <small>.txt</small></span></label>
-    <label><input type="checkbox" id="outAudio"> <span>Audio recording <small id="audioInfo"></small></span></label>
+    <fieldset>
+      <legend>Text: all recordings in one file</legend>
+      <label><input type="checkbox" id="outCorrected"> <span>Corrected transcript <small>.txt</small></span></label>
+      <label><input type="checkbox" id="outOriginal"> <span>Raw transcript, exactly as heard <small>.txt</small></span></label>
+      <label><input type="checkbox" id="outFixes"> <span>List of automatic fixes <small>.txt</small></span></label>
+    </fieldset>
+    <fieldset>
+      <legend>Audio: one file per recording</legend>
+      <div id="audioList"></div>
+      <p id="audioNone" class="muted">No audio was recorded.</p>
+    </fieldset>
     <div class="dialogActions">
       <button type="button" id="exportClose">Not now</button>
       <button type="button" id="exportSave" class="primary">Save selected</button>
