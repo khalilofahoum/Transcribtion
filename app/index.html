@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Transcriber</title>
+  <meta name="theme-color" content="#2563eb">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Transcriber</h1>
+      <div class="langs" role="group" aria-label="Spoken language">
+        <button type="button" data-lang="en">English</button>
+        <button type="button" data-lang="he" lang="he">עברית</button>
+        <button type="button" data-lang="ar" lang="ar">العربية</button>
+      </div>
+    </header>
+
+    <section class="recorder">
+      <button type="button" id="record" aria-pressed="false">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="recordLabel">Start recording</span>
+      </button>
+      <button type="button" id="pause" hidden>Pause</button>
+      <span id="timer" aria-live="off">00:00</span>
+    </section>
+    <p id="status" role="status"></p>
+
+    <section class="output">
+      <div class="outputBar">
+        <div class="views" id="views" hidden role="group" aria-label="Version">
+          <button type="button" data-view="corrected">Corrected</button>
+          <button type="button" data-view="original">Original</button>
+        </div>
+        <span id="count"></span>
+      </div>
+      <div id="transcript" spellcheck="true" aria-label="Transcript"></div>
+      <details id="fixes" hidden>
+        <summary id="fixesSummary"></summary>
+        <ul id="fixesList"></ul>
+      </details>
+      <div class="actions">
+        <button type="button" id="copy">Copy text</button>
+        <button type="button" id="export">Export…</button>
+        <button type="button" id="clear" class="quiet">Clear</button>
+      </div>
+    </section>
+
+    <details class="settings">
+      <summary>Settings</summary>
+      <label><input type="checkbox" id="optFillers"> Remove filler sounds (um, uh, אה, امم)</label>
+      <label><input type="checkbox" id="optPunct"> Add capital letters and end-of-sentence punctuation</label>
+      <label><input type="checkbox" id="optAudio"> Also record the audio (kept until you close the app)</label>
+      <label>Arabic dialect
+        <select id="optDialect">
+          <option value="ar-IL">Israel</option>
+          <option value="ar-PS">Palestine</option>
+          <option value="ar-JO">Jordan</option>
+          <option value="ar-LB">Lebanon</option>
+          <option value="ar-EG">Egypt</option>
+          <option value="ar-SA">Saudi Arabia / Standard</option>
+        </select>
+      </label>
+      <p class="hint">Speech is recognized by your browser's online speech service, so an internet connection is needed while recording. The transcript itself stays on this device.</p>
+    </details>
+  </main>
+
+  <dialog id="exportDialog" aria-labelledby="exportTitle">
+    <h2 id="exportTitle">Export</h2>
+    <p id="exportNote"></p>
+    <label><input type="checkbox" id="outCorrected"> <span>Corrected transcript <small>.txt</small></span></label>
+    <label><input type="checkbox" id="outOriginal"> <span>Raw transcript, exactly as heard <small>.txt</small></span></label>
+    <label><input type="checkbox" id="outFixes"> <span>List of automatic fixes <small>.txt</small></span></label>
+    <label><input type="checkbox" id="outAudio"> <span>Audio recording <small id="audioInfo"></small></span></label>
+    <div class="dialogActions">
+      <button type="button" id="exportClose">Not now</button>
+      <button type="button" id="exportSave" class="primary">Save selected</button>
+    </div>
+  </dialog>
+
+  <script src="corrector.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
