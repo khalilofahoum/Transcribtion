@@ -13,7 +13,7 @@
 
   const prefs = Object.assign(
     // Android cannot reliably share the microphone between the recorder and speech recognition, so audio is off there by default.
-    { lang: 'en', arDialect: 'ar-IL', fillers: true, punct: true, audio: !isAndroid },
+    { lang: 'en', arDialect: 'ar-IL', fillers: true, punct: true, audio: !isAndroid, source: 'default' },
     store.get('prefs', {})
   );
   prefs.export = Object.assign({ corrected: true, original: false, fixes: false }, prefs.export);
@@ -85,13 +85,20 @@
   let interim = '';
   let interimStart = 0;
   let fatal = false;
-  let quickEnds = 0;
+  let session = 0; // counts recordings, so timers left over from an earlier one do nothing
+  let finishing = false; // Stop was pressed and the last words are still arriving
+  let lastError = null; // a speech-service error that the next restart should report
+  let retryDelay = 0;
+  let retryTimer = null;
   let launchedAt = 0;
   let elapsed = 0;
   let tick = null;
   let wakeLock = null;
-  let audio = null; // { stream, recorder, chunks } while recording
+  let audio = null; // { recorder, chunks } while recording
   let audioFailed = false;
+  let input = null; // the open audio source: { stream, track, useTrack, kind, name }
+  let starting = false; // waiting for the audio source to open
+  let sourceStopped = ''; // why the source went away mid-recording, shown after saving
   const audioCache = new Map(); // recording id -> blob recorded in this app session
   let saveTimer = null;
   let editTimer = null;
@@ -106,6 +113,7 @@
     fixes: $('fixes'), fixesSummary: $('fixesSummary'), fixesList: $('fixesList'),
     copy: $('copy'), exportBtn: $('export'),
     optFillers: $('optFillers'), optPunct: $('optPunct'), optDialect: $('optDialect'), optAudio: $('optAudio'),
+    source: $('source'), sourceHint: $('sourceHint'),
     dialog: $('exportDialog'), exportNote: $('exportNote'), exportSave: $('exportSave'), exportClose: $('exportClose'),
     out: { corrected: $('outCorrected'), original: $('outOriginal'), fixes: $('outFixes') },
     audioList: $('audioList'), audioNone: $('audioNone'),
@@ -267,18 +275,43 @@
   }
 
   // ------------------------------------------------------------ recognition
+  // Only these errors mean recognition cannot work at all; anything else
+  // (dropped connection, busy microphone, the service ending early) is retried.
+  const FATAL = {
+    'not-allowed': 'Microphone access was blocked. Allow the microphone for this app in the browser, then start again.',
+    'service-not-allowed': 'Speech recognition is not allowed in this browser. Open the app in Google Chrome.',
+    'language-not-supported': 'This language is not supported by the speech service on this device.',
+  };
+
+  function reconnectMessage(err) {
+    const still = audio ? ' The audio is still being recorded.' : '';
+    if (err === 'network') return 'Lost the connection to the speech service. Reconnecting…' + still;
+    if (err === 'audio-capture') {
+      return 'The microphone is busy. Retrying…' + still +
+        (prefs.audio ? ' If this keeps happening, turn off "Also record the audio" in Settings.' : '');
+    }
+    return 'The speech service stopped. Reconnecting…' + still;
+  }
+
   function launch() {
     const lang = prefs.lang;
     const target = current;
-    rec = new SR();
-    rec.lang = langCode();
+    const me = new SR();
+    rec = me;
+    me.lang = langCode();
     // Android Chrome repeats earlier text in continuous mode, so use one phrase per session there.
-    rec.continuous = !isAndroid;
-    rec.interimResults = true;
-    rec.maxAlternatives = 3;
+    me.continuous = !isAndroid;
+    me.interimResults = true;
+    me.maxAlternatives = 3;
     launchedAt = Date.now();
 
-    rec.onresult = (e) => {
+    me.onresult = (e) => {
+      if (rec !== me) return;
+      if (retryDelay || lastError) {
+        retryDelay = 0;
+        lastError = null;
+        if (active && !paused) setStatus('Listening… speak now.');
+      }
       interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
@@ -304,68 +337,200 @@
       render();
     };
 
-    rec.onerror = (e) => {
-      if (e.error === 'no-speech' || e.error === 'aborted') return;
-      fatal = true;
-      const messages = {
-        'not-allowed': 'Microphone access was blocked. Allow the microphone for this app in the browser, then try again.',
-        'service-not-allowed': 'Speech recognition is not allowed in this browser. Open the app in Google Chrome.',
-        'audio-capture': prefs.audio
-          ? 'The microphone could not be used for transcription. Turn off "Also record the audio" in Settings and try again.'
-          : 'No microphone was found. Connect one and try again.',
-        'network': 'The speech service could not be reached. Check your internet connection and try again.',
-        'language-not-supported': 'This language is not supported by the speech service on this device.',
-      };
-      setStatus(messages[e.error] || 'Recording stopped: ' + e.error, true);
+    me.onerror = (e) => {
+      if (rec !== me || e.error === 'no-speech' || e.error === 'aborted') return;
+      if (FATAL[e.error]) {
+        fatal = true;
+        setStatus(FATAL[e.error], true);
+      } else {
+        lastError = e.error;
+      }
     };
 
-    rec.onend = () => {
+    me.onend = () => {
+      if (rec !== me) return;
       recAlive = false;
       interim = '';
       interimStart = 0;
-      if (active && !fatal) {
-        if (paused) { render(); return; }
-        // The browser ends sessions on silence; keep going until the user presses Stop.
-        quickEnds = Date.now() - launchedAt < 800 ? quickEnds + 1 : 0;
-        if (quickEnds >= 6) {
-          fatal = true;
-          setStatus('The speech service keeps stopping. Check the microphone and internet connection.', true);
-        } else {
-          setTimeout(() => { if (active && !paused && !recAlive) tryLaunch(); }, 200);
-          return;
-        }
+      if (!active || fatal) { finish(); return; }
+      if (paused) { render(); return; }
+      // The browser ends sessions on silence and on hiccups; keep going until the user presses Stop.
+      if (lastError || Date.now() - launchedAt < 1000) {
+        retryDelay = Math.min(retryDelay ? retryDelay * 2 : 500, 5000);
+        setStatus(reconnectMessage(lastError), true);
+      } else {
+        retryDelay = 0;
       }
-      finish();
+      lastError = null;
+      relaunch(retryDelay || 150);
+      render();
     };
 
-    rec.start();
+    if (input && input.useTrack) me.start(input.track);
+    else me.start();
     recAlive = true;
   }
 
+  function relaunch(delay) {
+    clearTimeout(retryTimer);
+    const s = session;
+    retryTimer = setTimeout(() => {
+      if (s === session && active && !paused && !recAlive && !document.hidden) tryLaunch();
+    }, delay);
+  }
+
   function tryLaunch() {
-    try { launch(); } catch (err) {
-      fatal = true;
-      setStatus('Could not start recording: ' + err.message, true);
-      finish();
+    try {
+      launch();
+    } catch {
+      // e.g. the previous session has not let go of the microphone yet
+      recAlive = false;
+      retryDelay = Math.min(retryDelay ? retryDelay * 2 : 500, 5000);
+      setStatus(reconnectMessage(null), true);
+      relaunch(retryDelay);
     }
   }
+
+  // Chrome stops listening while the window is minimized or hidden; pick up again when it is back.
+  document.addEventListener('visibilitychange', async () => {
+    if (document.hidden || !active) return;
+    if (!paused && !recAlive) relaunch(0);
+    try { if (!wakeLock || wakeLock.released) wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* optional */ }
+  });
 
   function scheduleSave(r) {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => DB.put('recordings', r).catch(dbError), 800);
   }
 
-  // ------------------------------------------------------------ audio recording
-  async function startAudio() {
-    audioFailed = false;
-    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { audioFailed = true; return; }
+  // ------------------------------------------------------------ audio source
+  // Desktop Chrome 133+ and Edge 135+ can transcribe a chosen audio track. Elsewhere
+  // (Android, other browsers) speech recognition always uses the default microphone.
+  const trackSupported = (() => {
+    if (isAndroid || !navigator.mediaDevices?.getUserMedia) return false;
+    const ua = navigator.userAgent;
+    const edge = ua.match(/Edg\/(\d+)/);
+    if (edge) return +edge[1] >= 135;
+    const chrome = ua.match(/Chrome\/(\d+)/);
+    return !!chrome && +chrome[1] >= 133;
+  })();
+  const displaySupported = trackSupported && !!navigator.mediaDevices?.getDisplayMedia;
+
+  const sourceName = (src) => {
+    if (src === 'default') return 'the default microphone';
+    if (src === 'display') return 'computer audio';
+    const o = [...el.source.options].find((x) => x.value === src);
+    return o ? o.textContent : 'the selected microphone';
+  };
+
+  async function refreshSources() {
+    if (!trackSupported) {
+      el.source.textContent = '';
+      el.source.add(new Option('Default microphone', 'default'));
+      el.source.disabled = true;
+      el.sourceHint.hidden = false;
+      el.sourceHint.textContent = isAndroid
+        ? 'On a phone the app always uses the default microphone.'
+        : 'This browser always uses the default microphone. Use Google Chrome to choose another source.';
+      return;
+    }
+    let devices = [];
+    try { devices = await navigator.mediaDevices.enumerateDevices(); } catch { /* keep the list empty */ }
+    const mics = devices.filter((d) => d.kind === 'audioinput');
+    const def = mics.find((d) => d.deviceId === 'default');
+    const real = mics.filter((d) => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
+    el.source.textContent = '';
+    const defName = def && def.label ? def.label.replace(/^Default\s*-\s*/i, '') : '';
+    el.source.add(new Option(defName ? `Default microphone (${defName})` : 'Default microphone', 'default'));
+    real.forEach((d, i) => el.source.add(new Option(d.label || `Microphone ${i + 1}`, d.deviceId)));
+    if (displaySupported) el.source.add(new Option('Computer audio (a meeting, video or call)', 'display'));
+    if (![...el.source.options].some((o) => o.value === prefs.source)) {
+      // Without microphone permission the device list is hidden, so keep the saved choice.
+      if (prefs.source !== 'default' && prefs.source !== 'display' && !real.length) {
+        el.source.add(new Option('Saved microphone', prefs.source));
+      } else {
+        prefs.source = 'default';
+      }
+    }
+    el.source.value = prefs.source;
+    showSourceHint();
+  }
+
+  function showSourceHint() {
+    if (!trackSupported) return;
+    const hint = prefs.source === 'display'
+      ? 'After pressing Start, pick the screen, window or tab that plays the sound and turn on "Share system audio" (or "Share tab audio").'
+      : '';
+    el.sourceHint.textContent = hint;
+    el.sourceHint.hidden = !hint;
+  }
+
+  // Opens the chosen source. It is called straight from the Start click, with no await
+  // before it, because sharing computer audio needs that click.
+  async function openInput() {
+    const src = trackSupported ? prefs.source : 'default';
+    if (src === 'display') {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        systemAudio: 'include',
+        selfBrowserSurface: 'exclude',
+      });
+      const track = stream.getAudioTracks()[0];
+      if (!track) {
+        stream.getTracks().forEach((t) => t.stop());
+        throw Object.assign(new Error('No audio was shared'), { name: 'NoAudioShared' });
+      }
+      return { stream, track, useTrack: true, kind: 'display', name: 'computer audio' };
+    }
+    if (src !== 'default') {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: src } } });
+      return { stream, track: stream.getAudioTracks()[0], useTrack: true, kind: 'mic', name: sourceName(src) };
+    }
+    // Default microphone: recognition opens it itself; only the audio recorder needs a stream.
+    if (!prefs.audio || !navigator.mediaDevices?.getUserMedia) return null;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      return { stream, track: stream.getAudioTracks()[0], useTrack: false, kind: 'mic', name: 'the default microphone' };
+    } catch {
+      return null; // still transcribe; the audio just is not kept
+    }
+  }
+
+  function inputError(err) {
+    const name = err && err.name;
+    if (name === 'NoAudioShared') {
+      return 'No sound was shared. Press Start again, pick the screen or tab, and turn on "Share system audio" (or "Share tab audio").';
+    }
+    if (name === 'NotAllowedError') {
+      return prefs.source === 'display'
+        ? 'Sharing was cancelled, so nothing was recorded.'
+        : 'Microphone access was blocked. Allow the microphone for this app in the browser, then start again.';
+    }
+    if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+      return 'The selected microphone was not found. Plug it in or choose another audio source.';
+    }
+    if (name === 'NotReadableError') {
+      return 'The selected microphone is being used by another program. Close it there or choose another audio source.';
+    }
+    return 'Could not open the audio source: ' + ((err && err.message) || err);
+  }
+
+  function closeInput() {
+    if (input) input.stream.getTracks().forEach((t) => t.stop());
+    input = null;
+  }
+
+  // ------------------------------------------------------------ audio recording
+  function startRecorder(track) {
+    audioFailed = false;
+    if (!window.MediaRecorder || !track) { audioFailed = true; return; }
+    try {
+      const recorder = new MediaRecorder(new MediaStream([track]));
       const chunks = [];
       recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
       recorder.start(1000);
-      audio = { stream, recorder, chunks };
+      audio = { recorder, chunks };
     } catch {
       audioFailed = true;
     }
@@ -377,10 +542,7 @@
       const a = audio;
       audio = null;
       if (!a) return resolve(null);
-      const done = () => {
-        a.stream.getTracks().forEach((t) => t.stop());
-        resolve(a.chunks.length ? new Blob(a.chunks, { type: a.recorder.mimeType || 'audio/webm' }) : null);
-      };
+      const done = () => resolve(a.chunks.length ? new Blob(a.chunks, { type: a.recorder.mimeType || 'audio/webm' }) : null);
       if (a.recorder.state === 'inactive') return done();
       a.recorder.onstop = done;
       try { a.recorder.stop(); } catch { done(); }
@@ -395,27 +557,54 @@
   }
 
   async function start() {
-    if (!memory) return;
+    if (!memory || active || starting || finishing) return;
+    starting = true;
+    setStatus('Starting…');
+    let inp;
+    try {
+      const opening = openInput(); // before any await, so the click still counts
+      render();
+      inp = await opening;
+    } catch (err) {
+      starting = false;
+      setStatus(inputError(err), true);
+      render();
+      return;
+    }
+    starting = false;
+    input = inp;
+    sourceStopped = '';
     current = {
       id: uid(), memoryId: memory.id, start: Date.now(), end: null, duration: 0,
       segments: [], edited: null, audioSize: 0, audioType: '',
+      source: input && input.useTrack ? input.name : 'the default microphone',
     };
     recordings.push(current);
     active = true;
     paused = false;
+    session++;
     sessionDone = false;
+    finishing = false;
     fatal = false;
-    quickEnds = 0;
+    lastError = null;
+    retryDelay = 0;
     elapsed = 0;
     showTimer();
-    setStatus('Starting…');
-    render();
     DB.put('recordings', current).catch(dbError);
-    if (prefs.audio) await startAudio();
-    if (!active) { stopAudio(); return; }
+    if (prefs.audio) startRecorder(input && input.track);
+    if (input && input.useTrack) {
+      // Unplugging the microphone or pressing "Stop sharing" ends the recording and saves it.
+      const kind = input.kind;
+      input.track.addEventListener('ended', () => {
+        if (!active) return;
+        sourceStopped = kind === 'display' ? 'Sharing was stopped' : 'The microphone was disconnected';
+        stop();
+      });
+    }
     setStatus(prefs.audio && audioFailed
-      ? 'Listening… (the audio itself could not be recorded on this device, only the text)'
-      : 'Listening… speak now.');
+      ? `Listening to ${current.source}… (the audio itself could not be recorded, only the text)`
+      : `Listening to ${current.source}…`);
+    render();
     startTimer();
     tryLaunch();
     try { wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* optional */ }
@@ -425,6 +614,7 @@
     if (!active || paused) return;
     paused = true;
     clearInterval(tick);
+    clearTimeout(retryTimer);
     try { rec?.stop(); } catch { /* already stopped */ }
     try { if (audio?.recorder.state === 'recording') audio.recorder.pause(); } catch { /* ignore */ }
     setStatus('Paused. Press Resume to keep going, or Stop to finish.');
@@ -434,7 +624,8 @@
   function resume() {
     if (!active || !paused) return;
     paused = false;
-    quickEnds = 0;
+    retryDelay = 0;
+    lastError = null;
     try { if (audio?.recorder.state === 'paused') audio.recorder.resume(); } catch { /* ignore */ }
     startTimer();
     setStatus('Listening… speak now.');
@@ -446,11 +637,16 @@
     if (!active) return;
     active = false;
     paused = false;
+    finishing = true;
     clearInterval(tick);
+    clearTimeout(retryTimer);
     setStatus('Finishing…');
+    render();
     if (!recAlive) { finish(); return; }
     try { rec.stop(); } catch { /* already stopped */ }
-    setTimeout(finish, 2000); // in case the browser never reports the end
+    // In case the browser never reports the end; ignored if this recording already finished.
+    const s = session;
+    setTimeout(() => { if (s === session) finish(); }, 2000);
   }
 
   async function finish() {
@@ -460,8 +656,13 @@
     paused = false;
     clearInterval(tick);
     clearTimeout(saveTimer);
+    clearTimeout(retryTimer);
+    if (recAlive) { try { rec.abort(); } catch { /* ignore */ } }
+    rec = null;
+    recAlive = false;
     const r = current;
     const blob = await stopAudio();
+    closeInput();
     try { wakeLock?.release(); } catch { /* ignore */ }
     wakeLock = null;
     let kept = false;
@@ -486,13 +687,17 @@
       }
     }
     current = null;
+    finishing = false;
     runCorrection();
     if (!fatal) {
-      setStatus(kept
+      const why = sourceStopped ? sourceStopped + ', so the recording ended. ' : '';
+      setStatus(why + (kept
         ? `Recording ${recordings.indexOf(r) + 1} saved. The text was checked and corrected; you can edit it directly.`
-        : 'Nothing was heard, so nothing was saved.');
+        : 'Nothing was heard, so nothing was saved.'), !!why);
     }
+    sourceStopped = '';
     render();
+    refreshSources(); // device names become readable once the microphone has been allowed
     if (!fatal && kept) openExport(true, r.id);
   }
 
@@ -558,7 +763,8 @@
       '',
     ];
     for (const r of done) {
-      out.push(rule, `Recording ${recNumber(r)}: ${fmtDate(r.start)} (${fmtDuration(r.duration)})`, rule, '');
+      const from = r.source && r.source !== 'the default microphone' ? `, ${r.source}` : '';
+      out.push(rule, `Recording ${recNumber(r)}: ${fmtDate(r.start)} (${fmtDuration(r.duration)}${from})`, rule, '');
       let body;
       if (kind === 'corrected') body = fixedText(r);
       else if (kind === 'original') body = rawText(r);
@@ -611,6 +817,7 @@
         info.textContent = paused ? 'paused' : 'recording now';
       } else {
         info.textContent = fmtDuration(r.duration) + (r.audioSize ? ' · audio' : '') +
+          (r.source && r.source !== 'the default microphone' ? ' · ' + r.source : '') +
           (showCorrected && r.edited != null ? ' · edited by hand' : '');
       }
       head.append(name, when, info);
@@ -654,10 +861,12 @@
 
     el.record.dataset.state = !active ? 'idle' : paused ? 'paused' : 'recording';
     el.record.setAttribute('aria-pressed', String(active));
-    el.recordLabel.textContent = active ? 'Stop' : doneCount ? 'Start new recording' : 'Start recording';
+    el.recordLabel.textContent = finishing ? 'Saving…' : starting ? 'Starting…' : active ? 'Stop' : doneCount ? 'Start new recording' : 'Start recording';
     el.pause.hidden = !active;
     el.pause.textContent = paused ? 'Resume' : 'Pause';
-    el.back.disabled = el.rename.disabled = active;
+    el.record.disabled = finishing || starting || !SR;
+    el.source.disabled = active || starting || finishing || !trackSupported;
+    el.back.disabled = el.rename.disabled = active || finishing;
 
     el.views.hidden = !corrected;
     for (const b of el.views.querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.view === view));
@@ -813,7 +1022,11 @@
     render();
   });
 
-  el.record.addEventListener('click', () => (active ? stop() : start()));
+  el.record.addEventListener('click', () => {
+    if (finishing) return;
+    if (active) stop();
+    else start();
+  });
   el.pause.addEventListener('click', () => (paused ? resume() : pause()));
 
   document.querySelector('.langs').addEventListener('click', (e) => {
@@ -822,7 +1035,10 @@
     prefs.lang = lang;
     store.set('prefs', prefs);
     render();
-    if (active && !paused && recAlive) { try { rec.stop(); } catch { /* restarts in onend with the new language */ } }
+    if (active && !paused && recAlive) {
+      launchedAt = 0; // a deliberate restart, not a hiccup
+      try { rec.stop(); } catch { /* restarts in onend with the new language */ }
+    }
   });
 
   el.views.addEventListener('click', (e) => {
@@ -871,12 +1087,20 @@
   bindOption(el.optDialect, 'arDialect', 'value');
   bindOption(el.optAudio, 'audio', 'checked');
 
+  el.source.addEventListener('change', () => {
+    prefs.source = el.source.value;
+    store.set('prefs', prefs);
+    showSourceHint();
+  });
+  navigator.mediaDevices?.addEventListener?.('devicechange', () => { if (!active) refreshSources(); });
+
   window.addEventListener('beforeunload', (e) => {
     if (active) { e.preventDefault(); e.returnValue = ''; }
   });
 
   // ------------------------------------------------------------ startup
   showHome();
+  refreshSources();
   if (!SR) {
     el.record.disabled = true;
     setStatus('This browser has no speech recognition. Open the app in Google Chrome (Windows or Android).', true, el.homeStatus);
