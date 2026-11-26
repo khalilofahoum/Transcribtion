@@ -147,6 +147,11 @@ button.link { border: 0; background: none; padding: 2px 4px; color: var(--accent
 .recHead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; margin-bottom: 6px; font-size: .84rem; color: var(--muted); line-height: 1.4; }
 .recHead strong { color: var(--text); font-size: .9rem; }
 .recHead .live { color: var(--rec); font-weight: 600; }
+.recHead .gapOpen { color: var(--warn-text); }
+.recHead .fillBtn { font-size: .84rem; padding: 0 2px; }
+.statusRow { display: flex; align-items: flex-start; gap: 8px; }
+.statusRow #status { flex: 1; }
+#skipFill { padding: 4px 12px; flex: none; }
 .recText { white-space: pre-wrap; border-radius: 6px; }
 .recText p { margin: 0 0 .7em; }
 .recText p:last-child { margin-bottom: 0; }
