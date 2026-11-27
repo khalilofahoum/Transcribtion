@@ -100,6 +100,15 @@
   let starting = false; // waiting for the audio source to open
   let sourceStopped = ''; // why the source went away mid-recording, shown after saving
   const audioCache = new Map(); // recording id -> blob recorded in this app session
+  // Recording time (ms of audio, pauses excluded) is what lines the text up with the audio file.
+  let activeBefore = 0; // recording time before the latest start or resume
+  let runStart = 0; // when recording last started or resumed (0 while paused or stopped)
+  let cover = []; // [from, to] stretches of recording time that live recognition heard
+  let coverFrom = null; // start of the stretch being heard right now
+  let lastFinalAt = 0; // recording time of the latest finished phrase in that stretch
+  let interimAt = 0;
+  let filling = null; // { recId, cancelled, stop } while going back over a recording
+  let fillCtx = null; // plays recordings back into speech recognition
   let saveTimer = null;
   let editTimer = null;
 
@@ -113,7 +122,7 @@
     fixes: $('fixes'), fixesSummary: $('fixesSummary'), fixesList: $('fixesList'),
     copy: $('copy'), exportBtn: $('export'),
     optFillers: $('optFillers'), optPunct: $('optPunct'), optDialect: $('optDialect'), optAudio: $('optAudio'),
-    source: $('source'), sourceHint: $('sourceHint'),
+    source: $('source'), sourceHint: $('sourceHint'), skipFill: $('skipFill'),
     dialog: $('exportDialog'), exportNote: $('exportNote'), exportSave: $('exportSave'), exportClose: $('exportClose'),
     out: { corrected: $('outCorrected'), original: $('outOriginal'), fixes: $('outFixes') },
     audioList: $('audioList'), audioNone: $('audioNone'),
@@ -305,8 +314,15 @@
     me.maxAlternatives = 3;
     launchedAt = Date.now();
 
+    me.onstart = () => {
+      if (rec !== me || coverFrom != null) return;
+      coverFrom = activeTime();
+      lastFinalAt = coverFrom;
+    };
+
     me.onresult = (e) => {
       if (rec !== me) return;
+      if (coverFrom == null) { coverFrom = activeTime(); lastFinalAt = coverFrom; }
       if (retryDelay || lastError) {
         retryDelay = 0;
         lastError = null;
@@ -321,16 +337,19 @@
             const text = r[j].transcript.trim();
             if (text) alternatives.push({ text, confidence: r[j].confidence || 0 });
           }
+          const now = activeTime();
           if (alternatives.length && target) {
             target.segments.push({
               text: alternatives[0].text, lang, confidence: alternatives[0].confidence, alternatives,
-              start: interimStart || Date.now(), end: Date.now(),
+              start: interimStart || Date.now(), end: Date.now(), at: interimAt || now, atEnd: now,
             });
             scheduleSave(target);
           }
+          lastFinalAt = now;
           interimStart = 0;
+          interimAt = 0;
         } else {
-          if (!interimStart) interimStart = Date.now();
+          if (!interimStart) { interimStart = Date.now(); interimAt = activeTime(); }
           interim += r[0].transcript;
         }
       }
@@ -350,8 +369,11 @@
     me.onend = () => {
       if (rec !== me) return;
       recAlive = false;
+      // After an error, words after the last finished phrase were lost; count them as missing.
+      closeCover(!!lastError || fatal);
       interim = '';
       interimStart = 0;
+      interimAt = 0;
       if (!active || fatal) { finish(); return; }
       if (paused) { render(); return; }
       // The browser ends sessions on silence and on hiccups; keep going until the user presses Stop.
@@ -369,6 +391,33 @@
     if (input && input.useTrack) me.start(input.track);
     else me.start();
     recAlive = true;
+  }
+
+  function activeTime() {
+    return activeBefore + (runStart ? Date.now() - runStart : 0);
+  }
+
+  function closeCover(errored) {
+    if (coverFrom == null) return;
+    const to = errored ? Math.max(coverFrom, lastFinalAt) : activeTime();
+    if (to > coverFrom) cover.push([coverFrom, to]);
+    coverFrom = null;
+  }
+
+  // Stretches longer than 1.5 s that live recognition did not hear (a dropped connection,
+  // a hidden window, a failed restart). Short restarts between phrases are normal.
+  function computeGaps(duration) {
+    const iv = cover.slice().sort((a, b) => a[0] - b[0]);
+    const gaps = [];
+    let pos = 0;
+    for (const [a, b] of iv) {
+      if (a - pos >= 1500) gaps.push([pos, a]);
+      pos = Math.max(pos, b);
+    }
+    if (duration - pos >= 1500) gaps.push([pos, duration]);
+    return gaps.map(([a, b]) => ({
+      from: Math.max(0, Math.round(a - 300)), to: Math.min(duration, Math.round(b + 300)), state: 'pending',
+    }));
   }
 
   function relaunch(delay) {
@@ -551,13 +600,12 @@
 
   // ------------------------------------------------------------ recording control
   function startTimer() {
-    const began = Date.now() - elapsed;
     clearInterval(tick);
-    tick = setInterval(() => { elapsed = Date.now() - began; showTimer(); }, 500);
+    tick = setInterval(() => { elapsed = activeTime(); showTimer(); }, 500);
   }
 
   async function start() {
-    if (!memory || active || starting || finishing) return;
+    if (!memory || active || starting || finishing || filling) return;
     starting = true;
     setStatus('Starting…');
     let inp;
@@ -578,6 +626,7 @@
       id: uid(), memoryId: memory.id, start: Date.now(), end: null, duration: 0,
       segments: [], edited: null, audioSize: 0, audioType: '',
       source: input && input.useTrack ? input.name : 'the default microphone',
+      langs: [{ at: 0, lang: prefs.lang }], gaps: [],
     };
     recordings.push(current);
     active = true;
@@ -589,9 +638,13 @@
     lastError = null;
     retryDelay = 0;
     elapsed = 0;
+    cover = [];
+    coverFrom = null;
     showTimer();
     DB.put('recordings', current).catch(dbError);
     if (prefs.audio) startRecorder(input && input.track);
+    activeBefore = 0;
+    runStart = Date.now(); // the audio file starts here
     if (input && input.useTrack) {
       // Unplugging the microphone or pressing "Stop sharing" ends the recording and saves it.
       const kind = input.kind;
@@ -615,8 +668,10 @@
     paused = true;
     clearInterval(tick);
     clearTimeout(retryTimer);
-    try { rec?.stop(); } catch { /* already stopped */ }
     try { if (audio?.recorder.state === 'recording') audio.recorder.pause(); } catch { /* ignore */ }
+    activeBefore = activeTime();
+    runStart = 0;
+    try { rec?.stop(); } catch { /* already stopped */ }
     setStatus('Paused. Press Resume to keep going, or Stop to finish.');
     render();
   }
@@ -627,6 +682,7 @@
     retryDelay = 0;
     lastError = null;
     try { if (audio?.recorder.state === 'paused') audio.recorder.resume(); } catch { /* ignore */ }
+    runStart = Date.now();
     startTimer();
     setStatus('Listening… speak now.');
     render();
@@ -640,6 +696,7 @@
     finishing = true;
     clearInterval(tick);
     clearTimeout(retryTimer);
+    if (runStart) { activeBefore = activeTime(); runStart = 0; }
     setStatus('Finishing…');
     render();
     if (!recAlive) { finish(); return; }
@@ -658,8 +715,10 @@
     clearTimeout(saveTimer);
     clearTimeout(retryTimer);
     if (recAlive) { try { rec.abort(); } catch { /* ignore */ } }
+    closeCover(false);
     rec = null;
     recAlive = false;
+    if (runStart) { activeBefore = activeTime(); runStart = 0; }
     const r = current;
     const blob = await stopAudio();
     closeInput();
@@ -668,7 +727,8 @@
     let kept = false;
     if (r) {
       r.end = Date.now();
-      r.duration = elapsed;
+      r.duration = activeTime();
+      r.gaps = computeGaps(r.duration);
       if (blob) {
         r.audioSize = blob.size;
         r.audioType = blob.type;
@@ -698,7 +758,237 @@
     sourceStopped = '';
     render();
     refreshSources(); // device names become readable once the microphone has been allowed
+    if (kept && r.gaps.length && blob && canFill()) await fillGaps(r);
     if (!fatal && kept) openExport(true, r.id);
+  }
+
+  // ------------------------------------------------------------ filling gaps from the audio
+  // Where live transcription missed something (connection lost, window hidden), the audio
+  // was still recorded. After Stop, those stretches are played back, silently, into speech
+  // recognition and the text is put in its place.
+  const canFill = () => trackSupported && !!SR && !!(window.AudioContext || window.webkitAudioContext);
+  const codeFor = (lang) => (lang === 'en' ? 'en-US' : lang === 'he' ? 'he-IL' : prefs.arDialect);
+  function langAt(r, t) {
+    let lang = (r.langs && r.langs[0] && r.langs[0].lang) || prefs.lang;
+    for (const x of r.langs || []) if (x.at <= t) lang = x.lang;
+    return lang;
+  }
+
+  // Must run inside a click so the browser lets the recording play.
+  function prepareFill() {
+    if (!canFill()) return;
+    try {
+      fillCtx = fillCtx || new (window.AudioContext || window.webkitAudioContext)();
+      fillCtx.resume().catch(() => {});
+    } catch { /* filling will report the problem */ }
+  }
+
+  function transcribeRange(blob, from, to, lang, onProgress) {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(blob);
+      const media = new Audio();
+      const out = [];
+      let error = null;
+      let done = false;
+      let sr = null;
+      let node = null;
+      let lastAt = from;
+      let ending = false;
+
+      const watchdog = setTimeout(() => { error = error || 'timeout'; end(); }, (to - from) + 30000);
+      function end() {
+        if (done) return;
+        done = true;
+        clearTimeout(watchdog);
+        try { media.pause(); } catch { /* ignore */ }
+        try { if (sr) sr.abort(); } catch { /* ignore */ }
+        try { if (node) node.disconnect(); } catch { /* ignore */ }
+        media.removeAttribute('src');
+        URL.revokeObjectURL(url);
+        resolve({ segments: out, error });
+      }
+      if (filling) filling.stop = () => { error = error || 'cancelled'; end(); };
+
+      function listen(track) {
+        sr = new SR();
+        sr.lang = codeFor(lang);
+        sr.continuous = true;
+        sr.interimResults = false;
+        sr.maxAlternatives = 3;
+        sr.onresult = (e) => {
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            const res = e.results[i];
+            if (!res.isFinal) continue;
+            const alternatives = [];
+            for (let j = 0; j < res.length; j++) {
+              const text = res[j].transcript.trim();
+              if (text) alternatives.push({ text, confidence: res[j].confidence || 0 });
+            }
+            if (!alternatives.length) continue;
+            const atEnd = Math.min(to, Math.max(lastAt, Math.round(media.currentTime * 1000)));
+            out.push({
+              text: alternatives[0].text, lang, confidence: alternatives[0].confidence, alternatives,
+              at: lastAt, atEnd, filled: true,
+            });
+            lastAt = atEnd;
+          }
+        };
+        sr.onerror = (e) => {
+          if (e.error !== 'no-speech' && e.error !== 'aborted') error = e.error;
+        };
+        sr.onend = () => {
+          if (done) return;
+          if (error || ending || media.paused || media.ended) { end(); return; }
+          try { listen(track); } catch { error = 'restart'; end(); } // ended on a silence; keep going
+        };
+        sr.start(track);
+      }
+
+      function reachedEnd() {
+        if (ending) return;
+        ending = true;
+        try { media.pause(); } catch { /* ignore */ }
+        // Give recognition a moment to finish the last phrase.
+        setTimeout(() => { try { if (sr) sr.stop(); else end(); } catch { end(); } }, 1500);
+      }
+
+      function begin() {
+        const target = from / 1000;
+        const go = () => {
+          media.removeEventListener('seeked', go);
+          try {
+            node = fillCtx.createMediaElementSource(media);
+            const dest = fillCtx.createMediaStreamDestination();
+            node.connect(dest); // not to the speakers: you hear nothing
+            listen(dest.stream.getAudioTracks()[0]);
+          } catch (err) {
+            error = 'setup: ' + ((err && err.message) || err);
+            end();
+            return;
+          }
+          media.play().catch(() => { error = 'playback'; end(); });
+        };
+        media.addEventListener('seeked', go);
+        media.currentTime = target;
+      }
+
+      media.preload = 'auto';
+      media.addEventListener('timeupdate', () => {
+        const pos = media.currentTime * 1000;
+        if (!ending && pos >= from) onProgress(Math.min(to, pos) - from);
+        if (pos >= to) reachedEnd();
+      });
+      media.addEventListener('ended', reachedEnd);
+      media.addEventListener('error', () => { error = 'the recording could not be read'; end(); });
+      media.addEventListener('loadedmetadata', () => {
+        if (Number.isFinite(media.duration)) { begin(); return; }
+        // Recordings made in the browser do not state their length; finding the end makes them seekable.
+        const known = () => {
+          if (!Number.isFinite(media.duration)) return;
+          media.removeEventListener('durationchange', known);
+          begin();
+        };
+        media.addEventListener('durationchange', known);
+        media.currentTime = 1e101;
+      }, { once: true });
+      media.src = url;
+    });
+  }
+
+  // Puts a filled-in phrase in time order. Where it overlaps its neighbours (the edges of a gap
+  // are heard twice, and a word cut in half there comes out as e.g. "report" vs "reports"),
+  // the repeated words are dropped, and a phrase that runs into the next one is joined to it.
+  const words = (t) => t.split(/\s+/).filter(Boolean);
+  const norm = (w) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, '');
+  const sameWord = (a, b) => a === b || (Math.min(a.length, b.length) >= 4 && (a.startsWith(b) || b.startsWith(a)));
+  function overlap(earlier, later) {
+    const a = earlier.map(norm);
+    const b = later.map(norm);
+    for (let n = Math.min(6, a.length, b.length); n > 0; n--) {
+      const tail = a.slice(-n);
+      if (tail.every((w, k) => sameWord(w, b[k])) && (n >= 2 || tail[0].length >= 4)) return n;
+    }
+    return 0;
+  }
+
+  function insertSegment(r, s) {
+    const segs = r.segments;
+    let i = segs.findIndex((x) => (x.at ?? 0) > s.at);
+    if (i < 0) i = segs.length;
+    const prev = segs[i - 1];
+    const next = segs[i];
+    let w = words(s.text);
+    if (prev && prev.lang === s.lang) w = w.slice(overlap(words(prev.text), w));
+    let joinNext = false;
+    if (next && next.lang === s.lang && w.length) {
+      const n = overlap(w, words(next.text));
+      if (n) { w = w.slice(0, -n); joinNext = true; }
+    }
+    if (!w.length) return 0;
+    const text = w.join(' ');
+    if (joinNext) {
+      next.text = text + ' ' + next.text;
+      next.alternatives = [{ text: next.text, confidence: next.confidence }];
+      next.at = s.at;
+      next.start = r.start + s.at;
+      next.filled = true;
+      return w.length;
+    }
+    if (text !== s.text) {
+      s.text = text;
+      s.alternatives = [{ text, confidence: s.confidence }];
+    }
+    s.start = r.start + s.at;
+    s.end = r.start + s.atEnd;
+    segs.splice(i, 0, s);
+    return w.length;
+  }
+
+  async function fillGaps(r) {
+    const todo = (r.gaps || []).filter((g) => g.state !== 'filled');
+    if (!todo.length || filling || !canFill()) return;
+    let blob = audioCache.get(r.id);
+    if (!blob) { try { blob = (await DB.get('audio', r.id))?.blob; } catch { blob = null; } }
+    if (!blob) return;
+    if (!fillCtx) prepareFill();
+    filling = { recId: r.id, cancelled: false, stop: null };
+    render();
+    const total = todo.reduce((n, g) => n + (g.to - g.from), 0) || 1;
+    let doneMs = 0;
+    let words = 0;
+    let failed = 0;
+    for (const g of todo) {
+      if (filling.cancelled) break;
+      const res = await transcribeRange(blob, g.from, g.to, langAt(r, g.from), (pos) => {
+        const pct = Math.min(99, Math.round(((doneMs + pos) / total) * 100));
+        setStatus(`Going back over the recording to fill ${plural(todo.length, 'gap')} in the text… ${pct}%`);
+      });
+      doneMs += g.to - g.from;
+      if (filling.cancelled) break;
+      if (res.error) { g.state = 'failed'; failed++; continue; }
+      g.state = 'filled';
+      g.words = 0;
+      for (const s of res.segments) g.words += insertSegment(r, s);
+      words += g.words;
+    }
+    const cancelled = filling.cancelled;
+    filling = null;
+    try { await DB.put('recordings', r); } catch (err) { dbError(err); }
+    runCorrection();
+    const left = (r.gaps || []).filter((g) => g.state !== 'filled').length;
+    const name = `Recording ${recNumber(r)}`;
+    if (cancelled) {
+      setStatus(`${name} saved. Skipped filling; ${plural(left, 'gap')} can be filled later with "Fill gaps".`);
+    } else if (failed) {
+      const some = todo.length - failed;
+      setStatus(`${name} saved. ${some ? `${plural(some, 'gap')} filled, but ` : ''}` +
+        `${plural(failed, 'gap')} could not be filled. Check the internet connection and press "Fill gaps" to try again.`, true);
+    } else {
+      setStatus(words
+        ? `${name}: ${plural(words, 'missing word')} filled in from the audio.`
+        : `${name}: the gaps in the text were silence; nothing was missing.`);
+    }
+    render();
   }
 
   // ------------------------------------------------------------ correction
@@ -732,10 +1022,13 @@
     const out = [];
     for (const s of segs) {
       const last = out[out.length - 1];
-      if (last && last.lang === s.lang && s.start - last.end < 2500) {
+      // Recording time when known (it lines up with filled-in phrases), else the clock.
+      const from = s.at ?? s.start;
+      const to = s.atEnd ?? s.end;
+      if (last && last.lang === s.lang && from - last.end < 2500) {
         last.text += ' ' + s.text;
-        last.end = s.end;
-      } else out.push({ lang: s.lang, text: s.text, end: s.end });
+        last.end = to;
+      } else out.push({ lang: s.lang, text: s.text, end: to });
     }
     return out;
   }
@@ -821,6 +1114,28 @@
           (showCorrected && r.edited != null ? ' · edited by hand' : '');
       }
       head.append(name, when, info);
+      if (!live && r.gaps && r.gaps.length) {
+        const filledWords = r.gaps.reduce((n, g) => n + (g.state === 'filled' ? g.words || 0 : 0), 0);
+        const open = r.gaps.filter((g) => g.state !== 'filled');
+        const gapNote = document.createElement('span');
+        if (filling && filling.recId === r.id) {
+          gapNote.textContent = 'filling gaps…';
+        } else if (open.length) {
+          gapNote.className = 'gapOpen';
+          gapNote.textContent = `${plural(open.length, 'gap')} without text`;
+        } else if (filledWords) {
+          gapNote.textContent = `${plural(filledWords, 'word')} filled in from the audio`;
+        }
+        if (gapNote.textContent) head.append(gapNote);
+        if (open.length && !filling && !active && r.audioSize && canFill()) {
+          const fill = document.createElement('button');
+          fill.type = 'button';
+          fill.className = 'link fillBtn';
+          fill.dataset.rec = r.id;
+          fill.textContent = 'Fill gaps';
+          head.append(fill);
+        }
+      }
 
       const body = document.createElement('div');
       body.className = 'recText';
@@ -861,12 +1176,13 @@
 
     el.record.dataset.state = !active ? 'idle' : paused ? 'paused' : 'recording';
     el.record.setAttribute('aria-pressed', String(active));
-    el.recordLabel.textContent = finishing ? 'Saving…' : starting ? 'Starting…' : active ? 'Stop' : doneCount ? 'Start new recording' : 'Start recording';
+    el.recordLabel.textContent = filling ? 'Checking the recording…' : finishing ? 'Saving…' : starting ? 'Starting…' : active ? 'Stop' : doneCount ? 'Start new recording' : 'Start recording';
     el.pause.hidden = !active;
     el.pause.textContent = paused ? 'Resume' : 'Pause';
-    el.record.disabled = finishing || starting || !SR;
+    el.record.disabled = finishing || starting || !!filling || !SR;
+    el.skipFill.hidden = !filling;
     el.source.disabled = active || starting || finishing || !trackSupported;
-    el.back.disabled = el.rename.disabled = active || finishing;
+    el.back.disabled = el.rename.disabled = active || finishing || !!filling;
 
     el.views.hidden = !corrected;
     for (const b of el.views.querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.view === view));
@@ -880,7 +1196,7 @@
     const hasText = recordings.some((r) => r !== current && r.segments.length);
     const hasAudio = recordings.some((r) => r !== current && r.audioSize);
     el.copy.disabled = !hasText || active;
-    el.exportBtn.disabled = !(hasText || hasAudio) || active;
+    el.exportBtn.disabled = !(hasText || hasAudio) || active || !!filling;
     for (const b of document.querySelectorAll('.langs button')) b.setAttribute('aria-pressed', String(b.dataset.lang === prefs.lang));
   }
 
@@ -990,14 +1306,74 @@
       const ext = /mp4/.test(type) ? 'm4a' : /ogg/.test(type) ? 'ogg' : 'webm';
       files.push([blob, `${base} - recording ${recNumber(r)} - ${stamp(r.start)}.${ext}`]);
     }
-    for (const [blob, name] of files) {
-      download(blob, name);
-      await new Promise((res) => setTimeout(res, 300)); // browsers drop downloads fired in the same instant
+    const lost = missing ? ` ${plural(missing, 'audio recording')} could not be found on this device.` : '';
+    if (!files.length) { updateExportButton(); setStatus(lost.trim(), true); return; }
+
+    let where;
+    try {
+      where = await saveWithPicker(files);
+    } catch (e) {
+      updateExportButton();
+      if (e && e.name === 'AbortError') { setStatus('Nothing was saved. Press Save again to choose a place.'); return; }
+      console.warn('Save picker failed, using Downloads instead', e);
+      where = null;
+    }
+    if (where === null) {
+      for (const [blob, name] of files) {
+        download(blob, name);
+        await new Promise((res) => setTimeout(res, 300)); // browsers drop downloads fired in the same instant
+      }
+      where = 'your Downloads folder';
     }
     el.dialog.close();
-    const msg = `Saved ${plural(files.length, 'file')} to your Downloads folder.` +
-      (missing ? ` ${plural(missing, 'audio recording')} could not be found on this device.` : '');
-    setStatus(msg, missing > 0);
+    setStatus(`Saved ${plural(files.length, 'file')} to ${where}.` + lost, missing > 0);
+  }
+
+  // Desktop Chrome and Edge can open the system's Save window. Other browsers
+  // (Android) fall back to the Downloads folder. Returns where the files went,
+  // or null when no picker is available.
+  const canPickFile = typeof window.showSaveFilePicker === 'function';
+  const canPickFolder = typeof window.showDirectoryPicker === 'function';
+  const PICKER = { id: 'transcriber-export', startIn: 'documents' };
+
+  async function saveWithPicker(files) {
+    if (files.length === 1 && canPickFile) {
+      const [blob, name] = files[0];
+      const handle = await window.showSaveFilePicker({ ...PICKER, suggestedName: name, types: fileTypes(name, blob) });
+      await writeFile(handle, blob);
+      return `"${handle.name}"`;
+    }
+    if (files.length > 1 && canPickFolder) {
+      const dir = await window.showDirectoryPicker({ ...PICKER, mode: 'readwrite' });
+      for (const [blob, name] of files) {
+        const handle = await dir.getFileHandle(await freeName(dir, name), { create: true });
+        await writeFile(handle, blob);
+      }
+      return `the folder "${dir.name}"`;
+    }
+    return null;
+  }
+
+  function fileTypes(name, blob) {
+    const ext = name.slice(name.lastIndexOf('.'));
+    const mime = ext === '.txt' ? 'text/plain' : (blob.type || 'audio/webm').split(';')[0];
+    return [{ description: ext === '.txt' ? 'Text file' : 'Audio file', accept: { [mime]: [ext] } }];
+  }
+
+  async function writeFile(handle, blob) {
+    const w = await handle.createWritable();
+    try { await w.write(blob); await w.close(); } catch (e) { try { await w.abort(); } catch {} throw e; }
+  }
+
+  // Never overwrite a file already in the chosen folder: add (2), (3), ...
+  async function freeName(dir, name) {
+    const dot = name.lastIndexOf('.');
+    const stem = name.slice(0, dot), ext = name.slice(dot);
+    for (let n = 1; n < 1000; n++) {
+      const candidate = n === 1 ? name : `${stem} (${n})${ext}`;
+      try { await dir.getFileHandle(candidate); } catch (e) { if (e.name === 'NotFoundError') return candidate; throw e; }
+    }
+    return `${stem} ${Date.now()}${ext}`;
   }
 
   // ------------------------------------------------------------ events
@@ -1023,9 +1399,26 @@
   });
 
   el.record.addEventListener('click', () => {
-    if (finishing) return;
-    if (active) stop();
-    else start();
+    if (finishing || filling) return;
+    if (active) {
+      prepareFill(); // inside the click, so the recording may be played back afterwards
+      stop();
+    } else start();
+  });
+
+  el.skipFill.addEventListener('click', () => {
+    if (!filling) return;
+    filling.cancelled = true;
+    if (filling.stop) filling.stop();
+  });
+
+  el.transcript.addEventListener('click', (e) => {
+    const btn = e.target.closest && e.target.closest('.fillBtn');
+    if (!btn || filling || active) return;
+    const r = recordings.find((x) => x.id === btn.dataset.rec);
+    if (!r) return;
+    prepareFill();
+    fillGaps(r);
   });
   el.pause.addEventListener('click', () => (paused ? resume() : pause()));
 
@@ -1034,6 +1427,7 @@
     if (!lang || lang === prefs.lang) return;
     prefs.lang = lang;
     store.set('prefs', prefs);
+    if (active && current && current.langs) current.langs.push({ at: activeTime(), lang });
     render();
     if (active && !paused && recAlive) {
       launchedAt = 0; // a deliberate restart, not a hiccup
@@ -1071,6 +1465,7 @@
 
   el.exportBtn.addEventListener('click', () => openExport(false));
   el.exportSave.addEventListener('click', saveSelected);
+  if (canPickFile || canPickFolder) el.exportSave.textContent = 'Save selected…';
   el.exportClose.addEventListener('click', () => el.dialog.close());
   el.dialog.addEventListener('change', updateExportButton);
 
@@ -1095,7 +1490,7 @@
   navigator.mediaDevices?.addEventListener?.('devicechange', () => { if (!active) refreshSources(); });
 
   window.addEventListener('beforeunload', (e) => {
-    if (active) { e.preventDefault(); e.returnValue = ''; }
+    if (active || filling) { e.preventDefault(); e.returnValue = ''; }
   });
 
   // ------------------------------------------------------------ startup
