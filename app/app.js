@@ -1306,14 +1306,74 @@
       const ext = /mp4/.test(type) ? 'm4a' : /ogg/.test(type) ? 'ogg' : 'webm';
       files.push([blob, `${base} - recording ${recNumber(r)} - ${stamp(r.start)}.${ext}`]);
     }
-    for (const [blob, name] of files) {
-      download(blob, name);
-      await new Promise((res) => setTimeout(res, 300)); // browsers drop downloads fired in the same instant
+    const lost = missing ? ` ${plural(missing, 'audio recording')} could not be found on this device.` : '';
+    if (!files.length) { updateExportButton(); setStatus(lost.trim(), true); return; }
+
+    let where;
+    try {
+      where = await saveWithPicker(files);
+    } catch (e) {
+      updateExportButton();
+      if (e && e.name === 'AbortError') { setStatus('Nothing was saved. Press Save again to choose a place.'); return; }
+      console.warn('Save picker failed, using Downloads instead', e);
+      where = null;
+    }
+    if (where === null) {
+      for (const [blob, name] of files) {
+        download(blob, name);
+        await new Promise((res) => setTimeout(res, 300)); // browsers drop downloads fired in the same instant
+      }
+      where = 'your Downloads folder';
     }
     el.dialog.close();
-    const msg = `Saved ${plural(files.length, 'file')} to your Downloads folder.` +
-      (missing ? ` ${plural(missing, 'audio recording')} could not be found on this device.` : '');
-    setStatus(msg, missing > 0);
+    setStatus(`Saved ${plural(files.length, 'file')} to ${where}.` + lost, missing > 0);
+  }
+
+  // Desktop Chrome and Edge can open the system's Save window. Other browsers
+  // (Android) fall back to the Downloads folder. Returns where the files went,
+  // or null when no picker is available.
+  const canPickFile = typeof window.showSaveFilePicker === 'function';
+  const canPickFolder = typeof window.showDirectoryPicker === 'function';
+  const PICKER = { id: 'transcriber-export', startIn: 'documents' };
+
+  async function saveWithPicker(files) {
+    if (files.length === 1 && canPickFile) {
+      const [blob, name] = files[0];
+      const handle = await window.showSaveFilePicker({ ...PICKER, suggestedName: name, types: fileTypes(name, blob) });
+      await writeFile(handle, blob);
+      return `"${handle.name}"`;
+    }
+    if (files.length > 1 && canPickFolder) {
+      const dir = await window.showDirectoryPicker({ ...PICKER, mode: 'readwrite' });
+      for (const [blob, name] of files) {
+        const handle = await dir.getFileHandle(await freeName(dir, name), { create: true });
+        await writeFile(handle, blob);
+      }
+      return `the folder "${dir.name}"`;
+    }
+    return null;
+  }
+
+  function fileTypes(name, blob) {
+    const ext = name.slice(name.lastIndexOf('.'));
+    const mime = ext === '.txt' ? 'text/plain' : (blob.type || 'audio/webm').split(';')[0];
+    return [{ description: ext === '.txt' ? 'Text file' : 'Audio file', accept: { [mime]: [ext] } }];
+  }
+
+  async function writeFile(handle, blob) {
+    const w = await handle.createWritable();
+    try { await w.write(blob); await w.close(); } catch (e) { try { await w.abort(); } catch {} throw e; }
+  }
+
+  // Never overwrite a file already in the chosen folder: add (2), (3), ...
+  async function freeName(dir, name) {
+    const dot = name.lastIndexOf('.');
+    const stem = name.slice(0, dot), ext = name.slice(dot);
+    for (let n = 1; n < 1000; n++) {
+      const candidate = n === 1 ? name : `${stem} (${n})${ext}`;
+      try { await dir.getFileHandle(candidate); } catch (e) { if (e.name === 'NotFoundError') return candidate; throw e; }
+    }
+    return `${stem} ${Date.now()}${ext}`;
   }
 
   // ------------------------------------------------------------ events
@@ -1405,6 +1465,7 @@
 
   el.exportBtn.addEventListener('click', () => openExport(false));
   el.exportSave.addEventListener('click', saveSelected);
+  if (canPickFile || canPickFolder) el.exportSave.textContent = 'Save selected…';
   el.exportClose.addEventListener('click', () => el.dialog.close());
   el.dialog.addEventListener('change', updateExportButton);
 

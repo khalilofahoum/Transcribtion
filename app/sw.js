@@ -1,6 +1,6 @@
 // Keeps the app shell available so the installed app opens instantly.
 // Network first, so updates always arrive; the cache is only the fallback.
-const CACHE = 'transcriber-v6';
+const CACHE = 'transcriber-v7';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'corrector.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {
